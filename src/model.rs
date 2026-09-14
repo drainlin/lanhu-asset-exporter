@@ -17,14 +17,6 @@ impl AssetMode {
             Self::FullLayers => "全量图层",
         }
     }
-
-    pub const fn description(self) -> &'static str {
-        match self {
-            Self::Cutouts => "仅 exportable PNG",
-            Self::Smart => "所有显式 SVG/PNG",
-            Self::FullLayers => "显式素材与 DDS 渲染",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,10 +36,38 @@ impl VersionMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetPlatform {
+    Ios,
+    Flutter,
+    Both,
+}
+
+impl TargetPlatform {
+    pub const ALL: [Self; 3] = [Self::Flutter, Self::Ios, Self::Both];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Ios => "iOS 原生",
+            Self::Flutter => "Flutter",
+            Self::Both => "双平台",
+        }
+    }
+
+    pub const fn includes_ios(self) -> bool {
+        matches!(self, Self::Ios | Self::Both)
+    }
+
+    pub const fn includes_flutter(self) -> bool {
+        matches!(self, Self::Flutter | Self::Both)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ExportOptions {
     pub asset_mode: AssetMode,
     pub version_mode: VersionMode,
+    pub target_platform: TargetPlatform,
     pub concurrency: usize,
 }
 
@@ -95,6 +115,8 @@ pub struct AssetManifest {
     pub kind: String,
     pub local_path: String,
     pub variants: Vec<AssetVariantManifest>,
+    pub source_pixel_width: Option<u32>,
+    pub source_pixel_height: Option<u32>,
     pub width: Option<f64>,
     pub height: Option<f64>,
     pub x: Option<f64>,

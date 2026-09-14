@@ -6,6 +6,7 @@ use std::sync::mpsc::Sender;
 
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt, stream};
+use image::GenericImageView;
 use reqwest::header::{CONTENT_TYPE, HeaderMap};
 use reqwest::{Client, Url};
 use serde_json::Value;
@@ -13,7 +14,7 @@ use serde_json::Value;
 use crate::curl::{CurlRequest, is_lanhu_host};
 use crate::model::{
     AssetManifest, AssetMode, AssetVariantManifest, ExportManifest, ExportOptions, PageManifest,
-    ProgressEvent, VersionManifest, VersionMode,
+    ProgressEvent, TargetPlatform, VersionManifest, VersionMode,
 };
 
 pub async fn run(
@@ -109,9 +110,17 @@ pub async fn run(
             serde_json::to_vec_pretty(&failures)?,
         )?;
     }
+    generate_platform_integrations(&output, &manifest, options.target_platform)?;
+    write_export_report(
+        &output,
+        &manifest,
+        &failures,
+        options.asset_mode,
+        options.target_platform,
+    )?;
     fs::write(
         output.join("AI_HANDOFF.md"),
-        render_ai_handoff(&manifest, options.asset_mode),
+        render_ai_handoff(&manifest, options.asset_mode, options.target_platform),
     )?;
     tx.send(ProgressEvent::Finished {
         output: output.display().to_string(),
@@ -121,7 +130,11 @@ pub async fn run(
     Ok(())
 }
 
-fn render_ai_handoff(manifest: &ExportManifest, mode: AssetMode) -> String {
+fn render_ai_handoff(
+    manifest: &ExportManifest,
+    mode: AssetMode,
+    target_platform: TargetPlatform,
+) -> String {
     const TEMPLATE: &str = include_str!("../AI_HANDOFF.template.md");
     let asset_count = manifest
         .pages
@@ -142,6 +155,7 @@ fn render_ai_handoff(manifest: &ExportManifest, mode: AssetMode) -> String {
         .replace("{{ASSET_COUNT}}", &asset_count.to_string())
         .replace("{{VARIANT_COUNT}}", &variant_count.to_string())
         .replace("{{ASSET_MODE}}", mode.label())
+        .replace("{{TARGET_PLATFORM}}", target_platform.label())
         .replace("{{MODE_GUIDANCE}}", mode_guidance(mode))
 }
 
@@ -157,6 +171,334 @@ fn mode_guidance(mode: AssetMode) -> &'static str {
             "This is the full-layers mode. It includes explicit SVG/PNG resources and DDS renderings for non-text layers; treat DDS assets as visual references rather than product assets."
         }
     }
+}
+
+fn write_export_report(
+    output: &Path,
+    manifest: &ExportManifest,
+    failures: &[String],
+    asset_mode: AssetMode,
+    target_platform: TargetPlatform,
+) -> Result<()> {
+    let versions = manifest
+        .pages
+        .iter()
+        .flat_map(|page| {
+            page.versions.iter().map(move |version| {
+                serde_json::json!({
+                    "page_name": page.name,
+                    "image_id": page.image_id,
+                    "version_id": version.version_id,
+                    "preview": version.preview,
+                    "selected_asset_count": version.assets.len(),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let pages_without_selected_cutouts = manifest
+        .pages
+        .iter()
+        .filter(|page| {
+            page.versions
+                .iter()
+                .all(|version| version.assets.is_empty())
+        })
+        .map(|page| {
+            serde_json::json!({
+                "page_name": page.name,
+                "image_id": page.image_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    let versions_without_preview = versions
+        .iter()
+        .filter(|version| version["preview"].is_null())
+        .cloned()
+        .collect::<Vec<_>>();
+    let resolution_warnings = manifest
+        .pages
+        .iter()
+        .flat_map(|page| {
+            page.versions.iter().flat_map(move |version| {
+                version.assets.iter().filter_map(move |asset| {
+                    let (Some(source_width), Some(source_height), Some(width), Some(height)) = (
+                        asset.source_pixel_width,
+                        asset.source_pixel_height,
+                        asset.width,
+                        asset.height,
+                    ) else {
+                        return None;
+                    };
+                    if asset.variants.is_empty() || width <= 0.0 || height <= 0.0 {
+                        return None;
+                    }
+                    let available_scale =
+                        (f64::from(source_width) / width).min(f64::from(source_height) / height);
+                    (available_scale < 3.0).then(|| {
+                        serde_json::json!({
+                            "page_name": page.name,
+                            "image_id": page.image_id,
+                            "version_id": version.version_id,
+                            "layer_name": asset.layer_name,
+                            "source_pixels": { "width": source_width, "height": source_height },
+                            "logical_size": { "width": width, "height": height },
+                            "available_scale": available_scale,
+                            "required_scale": 3.0,
+                        })
+                    })
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let selected_asset_count = manifest
+        .pages
+        .iter()
+        .flat_map(|page| &page.versions)
+        .map(|version| version.assets.len())
+        .sum::<usize>();
+    let variant_count = manifest
+        .pages
+        .iter()
+        .flat_map(|page| &page.versions)
+        .flat_map(|version| &version.assets)
+        .map(|asset| asset.variants.len())
+        .sum::<usize>();
+    let report = serde_json::json!({
+        "project": manifest.project,
+        "asset_mode": asset_mode.label(),
+        "target_platform": target_platform.label(),
+        "totals": {
+            "pages": manifest.pages.len(),
+            "versions": versions.len(),
+            "selected_assets": selected_asset_count,
+            "asset_variants": variant_count,
+        },
+        "pages_without_selected_cutouts": pages_without_selected_cutouts,
+        "versions_without_preview": versions_without_preview,
+        "download_failures": failures,
+        "source_resolution_warnings": resolution_warnings,
+    });
+    fs::write(
+        output.join("export_report.json"),
+        serde_json::to_vec_pretty(&report)?,
+    )?;
+
+    let zero_assets = report["pages_without_selected_cutouts"]
+        .as_array()
+        .expect("report array is present");
+    let missing_previews = report["versions_without_preview"]
+        .as_array()
+        .expect("report array is present");
+    let source_warnings = report["source_resolution_warnings"]
+        .as_array()
+        .expect("report array is present");
+    let mut markdown = format!(
+        "# Export Quality Report\n\nProject: {}\n\n- Asset mode: {}\n- Target platform: {}\n- Pages: {}\n- Versions: {}\n- Selected assets: {}\n- Asset variants: {}\n\n",
+        manifest.project,
+        asset_mode.label(),
+        target_platform.label(),
+        manifest.pages.len(),
+        versions.len(),
+        selected_asset_count,
+        variant_count,
+    );
+    markdown.push_str("## Pages Without Selected Cutouts\n\n");
+    if zero_assets.is_empty() {
+        markdown.push_str("None.\n\n");
+    } else {
+        markdown.push_str("These pages may still contain reconstructible text, shapes, gradients, or bitmap layers.\n\n");
+        for page in zero_assets {
+            markdown.push_str(&format!(
+                "- {} (`{}`)\n",
+                page["page_name"].as_str().unwrap_or("unknown"),
+                page["image_id"].as_str().unwrap_or("unknown"),
+            ));
+        }
+        markdown.push('\n');
+    }
+    markdown.push_str("## Versions Without Preview\n\n");
+    if missing_previews.is_empty() {
+        markdown.push_str("None.\n\n");
+    } else {
+        for version in missing_previews {
+            markdown.push_str(&format!(
+                "- {} / `{}`\n",
+                version["page_name"].as_str().unwrap_or("unknown"),
+                version["version_id"].as_str().unwrap_or("unknown"),
+            ));
+        }
+        markdown.push('\n');
+    }
+    markdown.push_str("## Download Failures\n\n");
+    if failures.is_empty() {
+        markdown.push_str("None.\n\n");
+    } else {
+        for failure in failures {
+            markdown.push_str(&format!("- {failure}\n"));
+        }
+        markdown.push('\n');
+    }
+    markdown.push_str("## Source Resolution Below Effective 3x\n\n");
+    if source_warnings.is_empty() {
+        markdown.push_str("None.\n");
+    } else {
+        markdown.push_str("Do not treat generated @3x files as higher-resolution source art when listed here.\n\n");
+        for warning in source_warnings {
+            markdown.push_str(&format!(
+                "- {} / `{}` / {}: {}x available from {}x{} source for {}x{} logical size\n",
+                warning["page_name"].as_str().unwrap_or("unknown"),
+                warning["version_id"].as_str().unwrap_or("unknown"),
+                warning["layer_name"].as_str().unwrap_or("unknown"),
+                warning["available_scale"],
+                warning["source_pixels"]["width"],
+                warning["source_pixels"]["height"],
+                warning["logical_size"]["width"],
+                warning["logical_size"]["height"],
+            ));
+        }
+    }
+    fs::write(output.join("EXPORT_REPORT.md"), markdown)?;
+    Ok(())
+}
+
+fn generate_platform_integrations(
+    output: &Path,
+    manifest: &ExportManifest,
+    target: TargetPlatform,
+) -> Result<()> {
+    let integrations = output.join("integrations");
+    let mut ios_map = Vec::new();
+    let mut flutter_map = Vec::new();
+    let mut flutter_asset_paths = Vec::new();
+    let mut asset_index = 0usize;
+
+    let ios_catalog = integrations.join("ios/Assets.xcassets");
+    if target.includes_ios() {
+        fs::create_dir_all(&ios_catalog)?;
+        fs::write(
+            ios_catalog.join("Contents.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "info": { "author": "xcode", "version": 1 }
+            }))?,
+        )?;
+    }
+    let flutter_assets = integrations.join("flutter/assets/lanhu");
+    if target.includes_flutter() {
+        fs::create_dir_all(&flutter_assets)?;
+    }
+
+    for page in &manifest.pages {
+        for version in &page.versions {
+            for asset in &version.assets {
+                if asset.variants.is_empty() {
+                    continue;
+                }
+                asset_index += 1;
+                let resource_name = format!("lanhu_asset_{asset_index:04}");
+                if target.includes_ios() {
+                    package_ios_asset(output, &ios_catalog, &resource_name, asset)?;
+                    ios_map.push(serde_json::json!({
+                        "resource_name": resource_name,
+                        "design_page": page.name,
+                        "layer_name": asset.layer_name,
+                        "source_path": asset.local_path,
+                    }));
+                }
+                if target.includes_flutter() {
+                    let flutter_path =
+                        package_flutter_asset(output, &flutter_assets, &resource_name, asset)?;
+                    flutter_asset_paths.push(flutter_path.clone());
+                    flutter_map.push(serde_json::json!({
+                        "asset_path": flutter_path,
+                        "design_page": page.name,
+                        "layer_name": asset.layer_name,
+                        "source_path": asset.local_path,
+                    }));
+                }
+            }
+        }
+    }
+
+    if target.includes_ios() {
+        let ios_output = integrations.join("ios");
+        fs::write(
+            ios_output.join("asset_map.json"),
+            serde_json::to_vec_pretty(&ios_map)?,
+        )?;
+    }
+    if target.includes_flutter() {
+        let flutter_output = integrations.join("flutter");
+        fs::write(
+            flutter_output.join("asset_map.json"),
+            serde_json::to_vec_pretty(&flutter_map)?,
+        )?;
+        let assets = flutter_asset_paths
+            .iter()
+            .map(|path| format!("    - {path}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            flutter_output.join("pubspec_assets.yaml"),
+            format!("flutter:\n  assets:\n{assets}\n"),
+        )?;
+    }
+    Ok(())
+}
+
+fn package_ios_asset(
+    output: &Path,
+    catalog: &Path,
+    resource_name: &str,
+    asset: &AssetManifest,
+) -> Result<()> {
+    let image_set = catalog.join(format!("{resource_name}.imageset"));
+    fs::create_dir_all(&image_set)?;
+    let mut images = Vec::new();
+    for variant in &asset.variants {
+        let filename = format!("{resource_name}@{}x.png", variant.scale);
+        copy_asset_file(output, &variant.local_path, &image_set.join(&filename))?;
+        images.push(serde_json::json!({
+            "filename": filename,
+            "idiom": "universal",
+            "scale": format!("{}x", variant.scale),
+        }));
+    }
+    fs::write(
+        image_set.join("Contents.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "images": images,
+            "info": { "author": "xcode", "version": 1 }
+        }))?,
+    )?;
+    Ok(())
+}
+
+fn package_flutter_asset(
+    output: &Path,
+    assets: &Path,
+    resource_name: &str,
+    asset: &AssetManifest,
+) -> Result<String> {
+    for variant in &asset.variants {
+        let directory = if variant.scale == 1 {
+            assets.to_owned()
+        } else {
+            assets.join(format!("{}.0x", variant.scale))
+        };
+        fs::create_dir_all(&directory)?;
+        copy_asset_file(
+            output,
+            &variant.local_path,
+            &directory.join(format!("{resource_name}.png")),
+        )?;
+    }
+    Ok(format!("assets/lanhu/{resource_name}.png"))
+}
+
+fn copy_asset_file(output: &Path, source_path: &str, destination: &Path) -> Result<()> {
+    fs::copy(output.join(source_path), destination)
+        .with_context(|| format!("cannot copy {} to {}", source_path, destination.display()))?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -246,6 +588,12 @@ async fn export_page(
                 safe_name(&asset.name)
             ));
             let bytes = get_bytes(client, checked_url(&asset.url)?, headers).await?;
+            let source_size = if options.asset_mode == AssetMode::Cutouts {
+                let source = image::load_from_memory(&bytes.body)?;
+                Some(source.dimensions())
+            } else {
+                None
+            };
             let (local, variants) = if options.asset_mode == AssetMode::Cutouts {
                 let variants = write_ios_variants(&local, &bytes.body, asset.width, asset.height)
                     .with_context(|| {
@@ -280,6 +628,8 @@ async fn export_page(
                         pixel_height: variant.pixel_height,
                     })
                     .collect(),
+                source_pixel_width: source_size.map(|size| size.0),
+                source_pixel_height: source_size.map(|size| size.1),
                 width: asset.width,
                 height: asset.height,
                 x: asset.x,
@@ -568,14 +918,17 @@ fn extension_for(kind: &str, content_type: &Option<String>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::fs;
     use std::io::Cursor;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba};
     use serde_json::json;
 
     use super::{
-        AssetMode, ExportManifest, PageManifest, collect_assets, render_ai_handoff,
-        render_ios_variant, safe_name, scaled_pixels,
+        AssetManifest, AssetMode, AssetVariantManifest, ExportManifest, PageManifest,
+        TargetPlatform, VersionManifest, collect_assets, generate_platform_integrations,
+        render_ai_handoff, render_ios_variant, safe_name, scaled_pixels, write_export_report,
     };
 
     #[test]
@@ -642,10 +995,140 @@ mod tests {
                 versions: Vec::new(),
             }],
         };
-        let handoff = render_ai_handoff(&manifest, AssetMode::Cutouts);
+        let handoff = render_ai_handoff(&manifest, AssetMode::Cutouts, TargetPlatform::Flutter);
         assert!(handoff.contains("Project: Example project"));
         assert!(handoff.contains("contains 1 pages"));
         assert!(handoff.contains("Lanhu cutout mode"));
+        assert!(handoff.contains("Target integration: Flutter"));
+    }
+
+    #[test]
+    fn generates_ios_and_flutter_integration_packages() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let output = std::env::temp_dir().join(format!("lanhu-exporter-test-{unique}"));
+        let asset_dir = output.join("pages/page/versions/v/assets");
+        fs::create_dir_all(&asset_dir).unwrap();
+        for (scale, suffix) in [(1, ""), (2, "@2x"), (3, "@3x")] {
+            fs::write(asset_dir.join(format!("icon{suffix}.png")), [scale]).unwrap();
+        }
+        let variants = vec![
+            AssetVariantManifest {
+                scale: 1,
+                local_path: "pages/page/versions/v/assets/icon.png".to_owned(),
+                pixel_width: 10,
+                pixel_height: 10,
+            },
+            AssetVariantManifest {
+                scale: 2,
+                local_path: "pages/page/versions/v/assets/icon@2x.png".to_owned(),
+                pixel_width: 20,
+                pixel_height: 20,
+            },
+            AssetVariantManifest {
+                scale: 3,
+                local_path: "pages/page/versions/v/assets/icon@3x.png".to_owned(),
+                pixel_width: 30,
+                pixel_height: 30,
+            },
+        ];
+        let manifest = ExportManifest {
+            project: "Example".to_owned(),
+            pages: vec![PageManifest {
+                image_id: "page-id".to_owned(),
+                name: "Page".to_owned(),
+                versions: vec![VersionManifest {
+                    version_id: "v".to_owned(),
+                    sketch_json: "sketch.json".to_owned(),
+                    preview: None,
+                    assets: vec![AssetManifest {
+                        layer_name: "icon".to_owned(),
+                        kind: "png".to_owned(),
+                        local_path: variants[0].local_path.clone(),
+                        variants,
+                        source_pixel_width: Some(20),
+                        source_pixel_height: Some(20),
+                        width: Some(10.0),
+                        height: Some(10.0),
+                        x: Some(0.0),
+                        y: Some(0.0),
+                    }],
+                }],
+            }],
+        };
+        generate_platform_integrations(&output, &manifest, TargetPlatform::Both).unwrap();
+        assert!(
+            output
+                .join("integrations/ios/Assets.xcassets/lanhu_asset_0001.imageset/Contents.json")
+                .exists()
+        );
+        assert!(
+            output
+                .join("integrations/flutter/assets/lanhu/3.0x/lanhu_asset_0001.png")
+                .exists()
+        );
+        assert!(
+            output
+                .join("integrations/flutter/pubspec_assets.yaml")
+                .exists()
+        );
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
+    fn writes_machine_and_agent_export_reports() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let output = std::env::temp_dir().join(format!("lanhu-exporter-report-test-{unique}"));
+        fs::create_dir_all(&output).unwrap();
+        let manifest = ExportManifest {
+            project: "Example".to_owned(),
+            pages: vec![PageManifest {
+                image_id: "page-id".to_owned(),
+                name: "Page".to_owned(),
+                versions: vec![VersionManifest {
+                    version_id: "v1".to_owned(),
+                    sketch_json: "sketch.json".to_owned(),
+                    preview: None,
+                    assets: vec![AssetManifest {
+                        layer_name: "icon".to_owned(),
+                        kind: "png".to_owned(),
+                        local_path: "icon.png".to_owned(),
+                        variants: vec![AssetVariantManifest {
+                            scale: 1,
+                            local_path: "icon.png".to_owned(),
+                            pixel_width: 10,
+                            pixel_height: 10,
+                        }],
+                        source_pixel_width: Some(20),
+                        source_pixel_height: Some(20),
+                        width: Some(10.0),
+                        height: Some(10.0),
+                        x: None,
+                        y: None,
+                    }],
+                }],
+            }],
+        };
+        write_export_report(
+            &output,
+            &manifest,
+            &["Page download failed".to_owned()],
+            AssetMode::Cutouts,
+            TargetPlatform::Flutter,
+        )
+        .unwrap();
+        let markdown = fs::read_to_string(output.join("EXPORT_REPORT.md")).unwrap();
+        let json = fs::read_to_string(output.join("export_report.json")).unwrap();
+        assert!(markdown.contains("Source Resolution Below Effective 3x"));
+        assert!(markdown.contains("Page download failed"));
+        assert!(json.contains("source_resolution_warnings"));
+        assert!(json.contains("available_scale"));
+        fs::remove_dir_all(output).unwrap();
     }
 
     #[test]

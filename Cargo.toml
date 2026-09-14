@@ -3,6 +3,9 @@ name = "lanhu_asset_exporter"
 version = "0.1.0"
 edition = "2024"
 description = "A Ratatui exporter for Lanhu Sketch JSON and development assets"
+license = "MIT"
+repository = "https://github.com/drainlin/lanhu-asset-exporter"
+readme = "README.md"
 publish = false
 
 [dependencies]

@@ -19,13 +19,16 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use crate::model::{AssetMode, ExportOptions, ProgressEvent, VersionMode, default_concurrency};
+use crate::model::{
+    AssetMode, ExportOptions, ProgressEvent, TargetPlatform, VersionMode, default_concurrency,
+};
 
 struct App {
     curl_input: String,
     focus: usize,
     asset_mode: usize,
     version_mode: usize,
+    target_platform: usize,
     status: String,
     progress: (usize, usize),
     exporting: bool,
@@ -40,6 +43,7 @@ impl Default for App {
             focus: 0,
             asset_mode: 0,
             version_mode: 0,
+            target_platform: 0,
             status: "等待粘贴蓝湖 images curl".into(),
             progress: (0, 0),
             exporting: false,
@@ -133,8 +137,8 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     match code {
         KeyCode::Esc if !app.exporting => app.should_quit = true,
         KeyCode::Char('q') if app.focus != 0 && !app.exporting => app.should_quit = true,
-        KeyCode::Tab if !app.exporting => app.focus = (app.focus + 1) % 3,
-        KeyCode::BackTab if !app.exporting => app.focus = (app.focus + 2) % 3,
+        KeyCode::Tab if !app.exporting => app.focus = (app.focus + 1) % 4,
+        KeyCode::BackTab if !app.exporting => app.focus = (app.focus + 3) % 4,
         KeyCode::Backspace if app.focus == 0 && !app.exporting => {
             app.curl_input.pop();
         }
@@ -149,6 +153,9 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         }
         KeyCode::Left | KeyCode::Right if app.focus == 2 && !app.exporting => {
             app.version_mode = (app.version_mode + 1) % VersionMode::ALL.len()
+        }
+        KeyCode::Left | KeyCode::Right if app.focus == 3 && !app.exporting => {
+            app.target_platform = (app.target_platform + 1) % TargetPlatform::ALL.len()
         }
         KeyCode::Enter if !app.exporting => start_export(app),
         _ => {}
@@ -166,6 +173,7 @@ fn start_export(app: &mut App) {
     let options = ExportOptions {
         asset_mode: AssetMode::ALL[app.asset_mode],
         version_mode: VersionMode::ALL[app.version_mode],
+        target_platform: TargetPlatform::ALL[app.target_platform],
         concurrency: default_concurrency(),
     };
     let (tx, rx) = mpsc::channel();
@@ -187,7 +195,7 @@ fn draw(frame: &mut Frame, app: &App) {
     let outer = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(3),
-        Constraint::Length(3),
+        Constraint::Length(4),
         Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Length(1),
@@ -235,20 +243,20 @@ fn draw(frame: &mut Frame, app: &App) {
             ),
         outer[1],
     );
-    let controls = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(outer[2]);
+    let controls = Layout::horizontal([
+        Constraint::Percentage(34),
+        Constraint::Percentage(33),
+        Constraint::Percentage(33),
+    ])
+    .split(outer[2]);
     frame.render_widget(
-        Paragraph::new(format!(
-            "{}  ·  {}",
-            AssetMode::ALL[app.asset_mode].label(),
-            AssetMode::ALL[app.asset_mode].description()
-        ))
-        .alignment(Alignment::Center)
-        .block(
-            Block::bordered()
-                .title(" 2  素材模式 ")
-                .border_style(focus_style(app.focus == 1)),
-        ),
+        Paragraph::new(AssetMode::ALL[app.asset_mode].label())
+            .alignment(Alignment::Center)
+            .block(
+                Block::bordered()
+                    .title(" 2  素材模式 ")
+                    .border_style(focus_style(app.focus == 1)),
+            ),
         controls[0],
     );
     frame.render_widget(
@@ -258,6 +266,16 @@ fn draw(frame: &mut Frame, app: &App) {
                 .border_style(focus_style(app.focus == 2)),
         ),
         controls[1],
+    );
+    frame.render_widget(
+        Paragraph::new(TargetPlatform::ALL[app.target_platform].label())
+            .alignment(Alignment::Center)
+            .block(
+                Block::bordered()
+                    .title(" 4  目标集成 ")
+                    .border_style(focus_style(app.focus == 3)),
+            ),
+        controls[2],
     );
     let action = if app.exporting {
         " 正在导出，请等待完成 ".to_owned()
@@ -281,6 +299,14 @@ fn draw(frame: &mut Frame, app: &App) {
     } else {
         app.progress.0 as f64 / app.progress.1 as f64
     };
+    let progress_area =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(3)]).split(outer[4]);
+    frame.render_widget(
+        Paragraph::new(app.status.as_str())
+            .alignment(Alignment::Center)
+            .style(Style::new().fg(Color::Gray)),
+        progress_area[0],
+    );
     frame.render_widget(
         Gauge::default()
             .block(
@@ -290,8 +316,8 @@ fn draw(frame: &mut Frame, app: &App) {
             )
             .gauge_style(Style::new().fg(Color::Cyan))
             .ratio(ratio)
-            .label(app.status.as_str()),
-        outer[4],
+            .label(format!("{}/{}", app.progress.0, app.progress.1)),
+        progress_area[1],
     );
     let hint = if app.exporting {
         "导出时暂时锁定输入，完成后可继续操作"
