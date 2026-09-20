@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssetMode {
@@ -88,20 +88,20 @@ mod tests {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ExportManifest {
     pub project: String,
     pub pages: Vec<PageManifest>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct PageManifest {
     pub image_id: String,
     pub name: String,
     pub versions: Vec<VersionManifest>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct VersionManifest {
     pub version_id: String,
     pub sketch_json: String,
@@ -109,7 +109,7 @@ pub struct VersionManifest {
     pub assets: Vec<AssetManifest>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AssetManifest {
     pub layer_name: String,
     pub kind: String,
@@ -123,7 +123,7 @@ pub struct AssetManifest {
     pub y: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AssetVariantManifest {
     pub scale: u8,
     pub local_path: String,
@@ -136,6 +136,9 @@ pub enum ProgressEvent {
     Started { project: String, pages: usize },
     Status(String),
     Progress { done: usize, total: usize },
+    AssetsDiscovered { count: usize },
+    AssetDownloaded,
+    Packaging { done: usize, total: usize },
     Finished { output: String, failures: usize },
     Failed(String),
 }

@@ -110,7 +110,11 @@ pub async fn run(
             serde_json::to_vec_pretty(&failures)?,
         )?;
     }
-    generate_platform_integrations(&output, &manifest, options.target_platform)?;
+    tx.send(ProgressEvent::Status(
+        "Packaging platform resources".to_owned(),
+    ))
+    .ok();
+    generate_platform_integrations(&output, &manifest, options.target_platform, Some(&tx))?;
     write_export_report(
         &output,
         &manifest,
@@ -128,6 +132,21 @@ pub async fn run(
     })
     .ok();
     Ok(())
+}
+
+pub fn rebuild_platform_integrations(output: &Path, target: TargetPlatform) -> Result<()> {
+    let manifest_path = output.join("manifest.json");
+    let manifest: ExportManifest = serde_json::from_slice(
+        &fs::read(&manifest_path)
+            .with_context(|| format!("cannot read {}", manifest_path.display()))?,
+    )
+    .with_context(|| format!("cannot parse {}", manifest_path.display()))?;
+    let integrations = output.join("integrations");
+    if integrations.exists() {
+        fs::remove_dir_all(&integrations)
+            .with_context(|| format!("cannot replace {}", integrations.display()))?;
+    }
+    generate_platform_integrations(output, &manifest, target, None)
 }
 
 fn render_ai_handoff(
@@ -365,12 +384,26 @@ fn generate_platform_integrations(
     output: &Path,
     manifest: &ExportManifest,
     target: TargetPlatform,
+    progress: Option<&Sender<ProgressEvent>>,
 ) -> Result<()> {
     let integrations = output.join("integrations");
     let mut ios_map = Vec::new();
     let mut flutter_map = Vec::new();
     let mut flutter_asset_paths = Vec::new();
     let mut asset_index = 0usize;
+    let asset_total = manifest
+        .pages
+        .iter()
+        .flat_map(|page| &page.versions)
+        .map(|version| version.assets.len())
+        .sum::<usize>();
+    if let Some(tx) = progress {
+        tx.send(ProgressEvent::Packaging {
+            done: 0,
+            total: asset_total,
+        })
+        .ok();
+    }
 
     let ios_catalog = integrations.join("ios/Assets.xcassets");
     if target.includes_ios() {
@@ -390,9 +423,6 @@ fn generate_platform_integrations(
     for page in &manifest.pages {
         for version in &page.versions {
             for asset in &version.assets {
-                if asset.variants.is_empty() {
-                    continue;
-                }
                 asset_index += 1;
                 let resource_name = format!("lanhu_asset_{asset_index:04}");
                 if target.includes_ios() {
@@ -401,6 +431,7 @@ fn generate_platform_integrations(
                         "resource_name": resource_name,
                         "design_page": page.name,
                         "layer_name": asset.layer_name,
+                        "source_kind": asset.kind,
                         "source_path": asset.local_path,
                     }));
                 }
@@ -412,8 +443,16 @@ fn generate_platform_integrations(
                         "asset_path": flutter_path,
                         "design_page": page.name,
                         "layer_name": asset.layer_name,
+                        "source_kind": asset.kind,
                         "source_path": asset.local_path,
                     }));
+                }
+                if let Some(tx) = progress {
+                    tx.send(ProgressEvent::Packaging {
+                        done: asset_index,
+                        total: asset_total,
+                    })
+                    .ok();
                 }
             }
         }
@@ -454,14 +493,24 @@ fn package_ios_asset(
     let image_set = catalog.join(format!("{resource_name}.imageset"));
     fs::create_dir_all(&image_set)?;
     let mut images = Vec::new();
-    for variant in &asset.variants {
-        let filename = format!("{resource_name}@{}x.png", variant.scale);
-        copy_asset_file(output, &variant.local_path, &image_set.join(&filename))?;
+    if asset.variants.is_empty() {
+        let filename = format!("{resource_name}.png");
+        write_platform_png(output, asset, &image_set.join(&filename))?;
         images.push(serde_json::json!({
             "filename": filename,
             "idiom": "universal",
-            "scale": format!("{}x", variant.scale),
+            "scale": "1x",
         }));
+    } else {
+        for variant in &asset.variants {
+            let filename = format!("{resource_name}@{}x.png", variant.scale);
+            copy_asset_file(output, &variant.local_path, &image_set.join(&filename))?;
+            images.push(serde_json::json!({
+                "filename": filename,
+                "idiom": "universal",
+                "scale": format!("{}x", variant.scale),
+            }));
+        }
     }
     fs::write(
         image_set.join("Contents.json"),
@@ -479,20 +528,56 @@ fn package_flutter_asset(
     resource_name: &str,
     asset: &AssetManifest,
 ) -> Result<String> {
-    for variant in &asset.variants {
-        let directory = if variant.scale == 1 {
-            assets.to_owned()
-        } else {
-            assets.join(format!("{}.0x", variant.scale))
-        };
-        fs::create_dir_all(&directory)?;
-        copy_asset_file(
-            output,
-            &variant.local_path,
-            &directory.join(format!("{resource_name}.png")),
-        )?;
+    if asset.variants.is_empty() {
+        write_platform_png(output, asset, &assets.join(format!("{resource_name}.png")))?;
+    } else {
+        for variant in &asset.variants {
+            let directory = if variant.scale == 1 {
+                assets.to_owned()
+            } else {
+                assets.join(format!("{}.0x", variant.scale))
+            };
+            fs::create_dir_all(&directory)?;
+            copy_asset_file(
+                output,
+                &variant.local_path,
+                &directory.join(format!("{resource_name}.png")),
+            )?;
+        }
     }
     Ok(format!("assets/lanhu/{resource_name}.png"))
+}
+
+fn write_platform_png(output: &Path, asset: &AssetManifest, destination: &Path) -> Result<()> {
+    let source = output.join(&asset.local_path);
+    if asset.kind == "svg" {
+        let png = render_svg_to_png(&fs::read(&source)?)?;
+        fs::write(destination, png)?;
+    } else {
+        fs::copy(&source, destination).with_context(|| {
+            format!(
+                "cannot copy {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn render_svg_to_png(source: &[u8]) -> Result<Vec<u8>> {
+    let tree = resvg::usvg::Tree::from_data(source, &resvg::usvg::Options::default())?;
+    let size = tree.size().to_int_size();
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(size.width(), size.height())
+        .context("SVG has invalid dimensions")?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::default(),
+        &mut pixmap.as_mut(),
+    );
+    pixmap
+        .encode_png()
+        .context("cannot encode rendered SVG as PNG")
 }
 
 fn copy_asset_file(output: &Path, source_path: &str, destination: &Path) -> Result<()> {
@@ -578,6 +663,10 @@ async fn export_page(
         let mut assets = Vec::new();
         let mut seen = HashSet::new();
         collect_assets(&sketch, options.asset_mode, &mut assets, &mut seen);
+        tx.send(ProgressEvent::AssetsDiscovered {
+            count: assets.len(),
+        })
+        .ok();
         let mut asset_entries = Vec::new();
         for (index, asset) in assets.iter().enumerate() {
             tx.send(ProgressEvent::Status(format!("{}: {}", name, asset.name)))
@@ -636,6 +725,7 @@ async fn export_page(
                 y: asset.y,
             });
             download_count += 1;
+            tx.send(ProgressEvent::AssetDownloaded).ok();
         }
         let preview_path = if let Some(url) = preview.as_deref() {
             let bytes = get_bytes(client, checked_url(url)?, headers).await?;
@@ -1058,7 +1148,7 @@ mod tests {
                 }],
             }],
         };
-        generate_platform_integrations(&output, &manifest, TargetPlatform::Both).unwrap();
+        generate_platform_integrations(&output, &manifest, TargetPlatform::Both, None).unwrap();
         assert!(
             output
                 .join("integrations/ios/Assets.xcassets/lanhu_asset_0001.imageset/Contents.json")
@@ -1072,6 +1162,85 @@ mod tests {
         assert!(
             output
                 .join("integrations/flutter/pubspec_assets.yaml")
+                .exists()
+        );
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
+    fn packages_reconstruction_png_and_svg_assets_for_platforms() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let output = std::env::temp_dir().join(format!("lanhu-exporter-smart-test-{unique}"));
+        let asset_dir = output.join("pages/page/versions/v/assets");
+        fs::create_dir_all(&asset_dir).unwrap();
+        fs::write(
+            asset_dir.join("icon.svg"),
+            r##"<svg width="2" height="2" xmlns="http://www.w3.org/2000/svg"><rect width="2" height="2" fill="#ff0000"/></svg>"##,
+        )
+        .unwrap();
+        let mut png = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(ImageBuffer::from_pixel(2, 2, Rgba([0, 255, 0, 255])))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        fs::write(asset_dir.join("photo.png"), png.into_inner()).unwrap();
+        let manifest = ExportManifest {
+            project: "Example".to_owned(),
+            pages: vec![PageManifest {
+                image_id: "page-id".to_owned(),
+                name: "Page".to_owned(),
+                versions: vec![VersionManifest {
+                    version_id: "v".to_owned(),
+                    sketch_json: "sketch.json".to_owned(),
+                    preview: None,
+                    assets: vec![
+                        AssetManifest {
+                            layer_name: "icon".to_owned(),
+                            kind: "svg".to_owned(),
+                            local_path: "pages/page/versions/v/assets/icon.svg".to_owned(),
+                            variants: vec![],
+                            source_pixel_width: None,
+                            source_pixel_height: None,
+                            width: Some(2.0),
+                            height: Some(2.0),
+                            x: Some(0.0),
+                            y: Some(0.0),
+                        },
+                        AssetManifest {
+                            layer_name: "photo".to_owned(),
+                            kind: "png".to_owned(),
+                            local_path: "pages/page/versions/v/assets/photo.png".to_owned(),
+                            variants: vec![],
+                            source_pixel_width: None,
+                            source_pixel_height: None,
+                            width: Some(2.0),
+                            height: Some(2.0),
+                            x: Some(0.0),
+                            y: Some(0.0),
+                        },
+                    ],
+                }],
+            }],
+        };
+        generate_platform_integrations(&output, &manifest, TargetPlatform::Both, None).unwrap();
+        let ios_map: serde_json::Value = serde_json::from_slice(
+            &fs::read(output.join("integrations/ios/asset_map.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ios_map.as_array().unwrap().len(), 2);
+        assert_eq!(ios_map[0]["source_kind"], "svg");
+        assert!(image::load_from_memory(
+            &fs::read(output.join(
+                "integrations/ios/Assets.xcassets/lanhu_asset_0001.imageset/lanhu_asset_0001.png"
+            ))
+            .unwrap()
+        )
+        .is_ok());
+        assert!(
+            output
+                .join("integrations/flutter/assets/lanhu/lanhu_asset_0002.png")
                 .exists()
         );
         fs::remove_dir_all(output).unwrap();

@@ -31,6 +31,9 @@ struct App {
     target_platform: usize,
     status: String,
     progress: (usize, usize),
+    assets_downloaded: usize,
+    assets_discovered: usize,
+    packaging: Option<(usize, usize)>,
     exporting: bool,
     should_quit: bool,
     receiver: Option<Receiver<ProgressEvent>>,
@@ -46,6 +49,9 @@ impl Default for App {
             target_platform: 0,
             status: "等待粘贴蓝湖 images curl".into(),
             progress: (0, 0),
+            assets_downloaded: 0,
+            assets_discovered: 0,
+            packaging: None,
             exporting: false,
             should_quit: false,
             receiver: None,
@@ -54,6 +60,9 @@ impl Default for App {
 }
 
 fn main() -> anyhow::Result<()> {
+    if let Some(result) = run_maintenance_command()? {
+        return result;
+    }
     enable_raw_mode()?;
     let mut out = stdout();
     execute!(
@@ -73,6 +82,28 @@ fn main() -> anyhow::Result<()> {
     )?;
     terminal.show_cursor()?;
     result
+}
+
+fn run_maintenance_command() -> anyhow::Result<Option<anyhow::Result<()>>> {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if arguments.is_empty() {
+        return Ok(None);
+    }
+    if arguments.len() != 3 || arguments[0] != "--rebuild-platform-integrations" {
+        anyhow::bail!(
+            "Usage: lanhu_asset_exporter --rebuild-platform-integrations <export-directory> <ios|flutter|both>"
+        );
+    }
+    let target = match arguments[2].as_str() {
+        "ios" => TargetPlatform::Ios,
+        "flutter" => TargetPlatform::Flutter,
+        "both" => TargetPlatform::Both,
+        _ => anyhow::bail!("platform must be ios, flutter, or both"),
+    };
+    Ok(Some(exporter::rebuild_platform_integrations(
+        Path::new(&arguments[1]),
+        target,
+    )))
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::Result<()> {
@@ -103,9 +134,19 @@ fn receive_progress(app: &mut App) {
                 ProgressEvent::Started { project, pages } => {
                     app.status = format!("Exporting {project} ({pages} pages)");
                     app.progress = (0, pages);
+                    app.assets_downloaded = 0;
+                    app.assets_discovered = 0;
+                    app.packaging = None;
                 }
                 ProgressEvent::Status(text) => app.status = text,
                 ProgressEvent::Progress { done, total } => app.progress = (done, total),
+                ProgressEvent::AssetsDiscovered { count } => {
+                    app.assets_discovered += count;
+                }
+                ProgressEvent::AssetDownloaded => app.assets_downloaded += 1,
+                ProgressEvent::Packaging { done, total } => {
+                    app.packaging = Some((done, total));
+                }
                 ProgressEvent::Finished { output, failures } => {
                     app.status = match open_output_directory(&output) {
                         Ok(()) => format!("导出完成：{failures} 项失败，已在 Finder 中打开目录"),
@@ -294,10 +335,38 @@ fn draw(frame: &mut Frame, app: &App) {
             .style(Style::new().fg(Color::Black).bold()),
         outer[3],
     );
-    let ratio = if app.progress.1 == 0 {
-        0.0
+    let (ratio, progress_label, progress_title) = if let Some((done, total)) = app.packaging {
+        let ratio = if total == 0 {
+            1.0
+        } else {
+            done as f64 / total as f64
+        };
+        (
+            ratio,
+            format!("{done}/{total}"),
+            " Platform package progress ",
+        )
+    } else if app.assets_discovered > 0 {
+        let ratio = app.assets_downloaded as f64 / app.assets_discovered as f64;
+        (
+            ratio,
+            format!(
+                "assets {}/{}  pages {}/{}",
+                app.assets_downloaded, app.assets_discovered, app.progress.0, app.progress.1
+            ),
+            " Asset download progress ",
+        )
     } else {
-        app.progress.0 as f64 / app.progress.1 as f64
+        let ratio = if app.progress.1 == 0 {
+            0.0
+        } else {
+            app.progress.0 as f64 / app.progress.1 as f64
+        };
+        (
+            ratio,
+            format!("pages {}/{}", app.progress.0, app.progress.1),
+            " Page discovery progress ",
+        )
     };
     let progress_area =
         Layout::vertical([Constraint::Length(1), Constraint::Length(3)]).split(outer[4]);
@@ -311,12 +380,12 @@ fn draw(frame: &mut Frame, app: &App) {
         Gauge::default()
             .block(
                 Block::bordered()
-                    .title(" 导出进度 ")
+                    .title(progress_title)
                     .border_style(Style::new().fg(Color::DarkGray)),
             )
             .gauge_style(Style::new().fg(Color::Cyan))
             .ratio(ratio)
-            .label(format!("{}/{}", app.progress.0, app.progress.1)),
+            .label(progress_label),
         progress_area[1],
     );
     let hint = if app.exporting {
