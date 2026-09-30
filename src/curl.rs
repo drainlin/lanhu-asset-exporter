@@ -69,12 +69,37 @@ mod tests {
     fn rejects_non_lanhu_targets() {
         assert!(parse_list_curl("curl --url https://example.com/api/project/images").is_err());
     }
+
+    #[test]
+    fn parses_browser_curl_with_empty_headers() {
+        let request = parse_list_curl(
+            "curl --url 'https://lanhuapp.com/api/project/images?project_id=p&team_id=t' \\\n+             -H 'last-request-session-id;' \\\n+             -H 'request-session-id;' \\\n+             -H 'accept: application/json' \\\n+             -H 'content-type: text/plain; charset=utf-8'",
+        )
+        .unwrap();
+        assert_eq!(request.headers.get("last-request-session-id").unwrap(), "");
+        assert_eq!(request.headers.get("request-session-id").unwrap(), "");
+        assert_eq!(request.headers.get("accept").unwrap(), "application/json");
+        assert_eq!(
+            request.headers.get("content-type").unwrap(),
+            "text/plain; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn rejects_headers_without_a_separator() {
+        assert!(
+            parse_list_curl("curl https://lanhuapp.com/api/project/images -H 'invalid-header'")
+                .is_err()
+        );
+    }
 }
 
 fn add_header(headers: &mut HeaderMap, raw: &str) -> Result<()> {
     let (name, value) = raw
         .split_once(':')
-        .context("header must use `Name: value`")?;
+        // curl uses a trailing semicolon to explicitly send an empty header.
+        .or_else(|| raw.strip_suffix(';').map(|name| (name, "")))
+        .context("header must use `Name: value` or `Name;` for an empty value")?;
     let name = HeaderName::from_bytes(name.trim().as_bytes())?;
     if matches!(name.as_str(), "host" | "content-length") {
         return Ok(());
